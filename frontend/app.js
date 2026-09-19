@@ -463,6 +463,9 @@ const state = {
   holeTarget: null,       // polygon id receiving the hole being drawn
   mode: "pan",            // calib | draw | hole | edit | pan
   displayUnit: "mm",
+  sensRadius: 1,          // 角点统一像素误差半径（敏感性评估输入）
+  sensitivity: null,      // {fp, radius, data} 最近一次敏感性评估结果
+  sensBusy: false,
   view: { scale: 1, x: 0, y: 0 }, // screen = image*scale + (x,y)
   hoverImg: null,
   dragging: null,         // drag descriptor
@@ -835,6 +838,7 @@ function escapeHtml(s) {
 }
 
 function renderPolyList() {
+  dropStaleSensitivity(); // 角点/半径/区域已变化 -> 旧评估自动作废
   const list = els.polyList;
   list.innerHTML = "";
   if (state.polygons.length === 0) {
@@ -887,6 +891,7 @@ function renderPolyList() {
       ${grossConv != null && poly.holes.length
         ? `<div class="poly-meta m-gross">外环面积 ${fmtNum(grossConv)} ${areaUnit} · ${poly.holes.length} 个孔洞 · ${poly.points.length} 外环顶点</div>`
         : `<div class="poly-meta m-gross">${poly.points.length} 个外环顶点${poly.holes.length ? " · " + poly.holes.length + " 个孔洞" : ""}</div>`}
+      ${sensBlockHtml(poly, areaUnit)}
       ${holeRows ? `<div class="hole-list">${holeRows}</div>` : ""}
       <div class="poly-actions">
         <button class="btn btn-ghost add-hole-btn" data-id="${poly.id}" title="在该区域外环内绘制新的镂空孔洞">▰ 添加孔洞</button>
@@ -929,10 +934,15 @@ function renderPolyList() {
 /** Update metric values inside existing cards without rebuilding the DOM
  *  (used while dragging, so the rename <input> keeps focus). */
 function updatePolyCardMetrics() {
+  // Dragging a vertex changes region geometry: stale sensitivity blocks go.
+  const hadSens = state.sensitivity !== null;
+  dropStaleSensitivity();
+  const sensGone = hadSens && !state.sensitivity;
   const cards = els.polyList.querySelectorAll(".poly-card");
   cards.forEach((card, i) => {
     const poly = state.polygons[i];
     if (!poly) return;
+    if (sensGone) card.querySelectorAll(".sens-info").forEach((el) => el.remove());
     const areaConv = convertValue(poly.area, state.unit, state.displayUnit, true);
     const perConv = convertValue(poly.perimeter, state.unit, state.displayUnit, false);
     const areaUnit = state.displayUnit === "px" ? "px²" : `${state.displayUnit}²`;
@@ -991,6 +1001,7 @@ function refreshUI() {
   renderPolyList();
   renderModeButtons();
   updateUnitOptions();
+  refreshSensButton();
   render();
 }
 
@@ -1065,6 +1076,88 @@ function polyGeometrySignature(poly) {
     o: poly.points.map((p) => [Math.round(p.x * 1000), Math.round(p.y * 1000)]),
     h: (poly.holes || []).map((h) => h.points.map((p) => [Math.round(p.x * 1000), Math.round(p.y * 1000)])),
   });
+}
+
+/* ------------------------------------------------------- sensitivity --- */
+/** Fingerprint of everything a sensitivity report depends on: calibration
+ *  corners + rect dims + unit, the error radius, and every region's geometry. */
+function sensFingerprint() {
+  return JSON.stringify({
+    c: state.corners.map((p) => [Math.round(p.x * 1000), Math.round(p.y * 1000)]),
+    w: state.rectW, h: state.rectH, u: state.unit, r: state.sensRadius,
+    p: state.polygons.map((pl) => [pl.id, polyGeometrySignature(pl)]),
+  });
+}
+
+/** 角点、误差半径或区域变化后自动作废旧评估结果。 */
+function dropStaleSensitivity() {
+  if (state.sensitivity && state.sensitivity.fp !== sensFingerprint())
+    state.sensitivity = null;
+}
+
+function refreshSensButton() {
+  els.sensRun.disabled = state.sensBusy || !state.calibValid || state.polygons.length === 0;
+}
+
+async function runSensitivity() {
+  const r = state.sensRadius;
+  if (!state.calibValid) { showNotice("请先完成有效的四点透视标定", true); return; }
+  if (!state.polygons.length) { showNotice("请先绘制至少一个测量区域", true); return; }
+  if (!(isFinite(r) && r > 0 && r <= 1000)) {
+    showNotice("误差半径需为 0–1000 px 之间的正数", true);
+    return;
+  }
+  state.sensBusy = true;
+  refreshSensButton();
+  els.sensRun.textContent = "评估中…";
+  try {
+    const data = await api(`/api/sessions/${state.sessionId}/sensitivity`, {
+      method: "POST",
+      body: JSON.stringify({ radius_px: r }),
+    });
+    // Fingerprint AFTER the await: if the geometry changed in flight the
+    // result is immediately stale and gets dropped on the next render.
+    state.sensitivity = { fp: sensFingerprint(), radius: r, data };
+    renderPolyList();
+    if (!data.reliable)
+      showNotice("标定敏感性：" + (data.message || "有效样本比例过低，请重新标定"), true);
+    else
+      toast(`敏感性评估完成：${data.sample_count} 组扰动，覆盖率 ${(data.valid_ratio * 100).toFixed(1)}%`);
+  } catch (err) {
+    toast("敏感性评估失败：" + err.message, true);
+  } finally {
+    state.sensBusy = false;
+    els.sensRun.textContent = "评估敏感性";
+    refreshSensButton();
+  }
+}
+
+/** Per-card sensitivity block: P5–P95 intervals + valid-sample coverage. */
+function sensBlockHtml(poly, areaUnit) {
+  const pack = state.sensitivity;
+  if (!pack) return "";
+  const entry = pack.data.polygons.find((sp) => sp.id === poly.id);
+  if (!entry) return "";
+  const pct = (entry.valid_ratio * 100).toFixed(1);
+  const head = `标定敏感性 ±${fmtNum(pack.radius)}px · 覆盖率 ${pct}%（${entry.valid_samples}/${entry.sample_count}）`;
+  if (!entry.reliable) {
+    return `<div class="sens-info bad">
+      <div class="sens-head">${head} · 低于 80%</div>
+      <div class="sens-row"><span>退化 / 越界 / 几何非法样本过多，区间不予显示 —— 请重新标定（让参照矩形占更大画面比例、减小拍摄倾角，或调小误差半径）。</span></div>
+    </div>`;
+  }
+  const a5 = convertValue(entry.area.p5, state.unit, state.displayUnit, true);
+  const a50 = convertValue(entry.area.p50, state.unit, state.displayUnit, true);
+  const a95 = convertValue(entry.area.p95, state.unit, state.displayUnit, true);
+  const p5 = convertValue(entry.perimeter.p5, state.unit, state.displayUnit, false);
+  const p50 = convertValue(entry.perimeter.p50, state.unit, state.displayUnit, false);
+  const p95 = convertValue(entry.perimeter.p95, state.unit, state.displayUnit, false);
+  return `<div class="sens-info">
+    <div class="sens-head">${head}</div>
+    <div class="sens-row"><span>面积 P5–P95</span><b>${fmtNum(a5)} – ${fmtNum(a95)} ${areaUnit}</b></div>
+    <div class="sens-row"><span>周长 P5–P95</span><b>${fmtNum(p5)} – ${fmtNum(p95)} ${state.displayUnit}</b></div>
+    <div class="sens-row sens-med"><span>P50 中位</span><span>${fmtNum(a50)} ${areaUnit} · ${fmtNum(p50)} ${state.displayUnit}</span></div>
+  </div>`;
 }
 
 function makeLastValid(poly) {
@@ -1710,6 +1803,14 @@ els.displayUnit.addEventListener("change", () => {
   renderPolyList();
 });
 
+/* --------------------------------------------------------- sensitivity - */
+els.sensRadius.addEventListener("input", () => {
+  state.sensRadius = parseFloat(els.sensRadius.value);
+  dropStaleSensitivity(); // 误差半径变化 -> 旧评估作废
+  renderPolyList();
+});
+els.sensRun.addEventListener("click", () => { void runSensitivity(); });
+
 /* ============================================================ upload ===== */
 async function ensureSession() {
   let sid = null;
@@ -1730,6 +1831,7 @@ async function ensureSession() {
 
 function hydrateSession(s) {
   state.sessionId = s.session_id;
+  state.sensitivity = null;
   try { localStorage.setItem("pr_sid", s.session_id); } catch { /* ignore */ }
   if (s.image) {
     state.image = s.image;
@@ -1779,6 +1881,7 @@ function resetUI() {
   state.holeDraft = [];
   state.holeTarget = null;
   state.selected = null;
+  state.sensitivity = null;
   els.exportBtn.disabled = true;
   els.emptyOverlay.classList.remove("hidden");
 }
@@ -1819,6 +1922,7 @@ async function uploadFile(file) {
   state.holeDraft = [];
   state.holeTarget = null;
   state.selected = null;
+  state.sensitivity = null;
   els.rectW.value = ""; els.rectH.value = "";
   state.rectW = null; state.rectH = null;
   els.modeDraw.disabled = true;

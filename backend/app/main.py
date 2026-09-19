@@ -23,6 +23,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from .geometry import HomographyResult, measure_region, solve_homography
+from .sensitivity import run_sensitivity
 
 BASE_DIR = Path(__file__).resolve().parent
 # backend/app/main.py -> parents: backend/, workspace/
@@ -33,7 +34,7 @@ STATIC_DIR = BASE_DIR.parents[1] / "frontend"
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 SESS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="平面照片标尺校准", version="1.0.0")
+app = FastAPI(title="平面照片标尺校准", version="1.1.0")
 
 _LOCK = threading.RLock()
 _SESSIONS: dict[str, dict[str, Any]] = {}
@@ -60,7 +61,12 @@ def _load_sessions() -> None:
             # Backward compatibility: sessions saved before holes existed have
             # no "holes" key on polygon records.
             for poly in s.get("polygons", []):
-                poly.setdefault("holes", [])
+                holes = poly.setdefault("holes", [])
+                # ...and an early build stored a hole as a bare point list
+                # instead of {"points": [...]}; normalize on load.
+                for k, h in enumerate(holes):
+                    if isinstance(h, list):
+                        holes[k] = {"points": h}
             _SESSIONS[s["id"]] = s
         except (json.JSONDecodeError, KeyError):
             continue
@@ -110,6 +116,10 @@ class PolygonPatch(BaseModel):
     points: list[Point] = Field(..., min_length=1, max_length=MAX_RING_POINTS)
     holes: list[RingIn] | None = Field(None, max_length=MAX_HOLES)
     name: str | None = Field(None, max_length=80)
+
+
+class SensitivityIn(BaseModel):
+    radius_px: float = Field(..., gt=0, le=1000, description="四个标定角点统一的像素误差半径")
 
 
 def _cal_payload(s: dict[str, Any]) -> dict[str, Any] | None:
@@ -291,6 +301,47 @@ def set_calibration(sid: str, body: CalibrationIn) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Calibration sensitivity
+# ---------------------------------------------------------------------------
+
+@app.post("/api/sessions/{sid}/sensitivity")
+def calibration_sensitivity(sid: str, body: SensitivityIn) -> dict[str, Any]:
+    """Reproducible perturbation analysis of the current calibration.
+
+    Generates a fixed set of 128 corner perturbations (seeded by the session's
+    calibration geometry), re-solves the homography and re-measures every
+    region for each set, and reports P5/P50/P95 of area and perimeter plus the
+    valid-sample ratio.  Out-of-bounds, degenerate and geometrically invalid
+    samples all count as failures; intervals are withheld below 80% valid.
+    """
+    s = _get(sid)
+    if not s.get("image"):
+        raise HTTPException(status_code=400, detail="请先上传照片")
+    cal = s.get("calibration")
+    if not cal or not cal.get("valid") or not cal.get("H"):
+        raise HTTPException(status_code=400, detail="请先完成有效的四点透视标定")
+    corners = [[c["x"], c["y"]] for c in cal["corners"]]
+    polygons = [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "outer": [[pt["x"], pt["y"]] for pt in p["points"]],
+            "holes": [[[q["x"], q["y"]] for q in h["points"]] for h in p.get("holes", [])],
+        }
+        for p in s["polygons"]
+    ]
+    return run_sensitivity(
+        corners,
+        cal["rect_width"],
+        cal["rect_height"],
+        body.radius_px,
+        polygons,
+        s["image"]["width"],
+        s["image"]["height"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Polygons
 # ---------------------------------------------------------------------------
 
@@ -303,18 +354,21 @@ def _validate_points_in_image(s: dict[str, Any], points: list[Point], what: str 
             raise HTTPException(status_code=400, detail=f"{what} {i + 1} 超出图像范围")
 
 
-def _rings_from_body(body: PolygonIn | PolygonPatch) -> tuple[list[dict[str, float]], list[list[dict[str, float]]]]:
+def _rings_from_body(body: PolygonIn | PolygonPatch) -> tuple[list[dict[str, float]], list[dict[str, Any]]]:
+    """Request rings -> stored shape.  Holes are stored as {"points": [...]}
+    dicts, matching _measure_payload / _holes_payload and the frontend."""
     outer = [{"x": p.x, "y": p.y} for p in body.points]
-    holes = [[{"x": q.x, "y": q.y} for q in ring.points] for ring in (body.holes or [])]
+    holes = [{"points": [{"x": q.x, "y": q.y} for q in ring.points]} for ring in (body.holes or [])]
     return outer, holes
 
 
-def _conflict_response(poly: dict[str, Any], cal: dict[str, Any] | None) -> JSONResponse:
+def _conflict_response(poly: dict[str, Any], cal: dict[str, Any] | None,
+                       errors: list[str] | None = None) -> JSONResponse:
     """422 with the conflict detail and the last valid server-side result."""
     m = _measure_payload(poly, cal)
     return JSONResponse(
         status_code=422,
-        content={"detail": "非法几何：" + "；".join(m["errors"]), "polygon": m},
+        content={"detail": "非法几何：" + "；".join(errors or m["errors"]), "polygon": m},
     )
 
 
@@ -337,7 +391,7 @@ def add_polygon(sid: str, body: PolygonIn) -> JSONResponse:
         check = measure_region(
             cal["H"],
             [[p["x"], p["y"]] for p in outer],
-            [[[p["x"], p["y"]] for p in h] for h in holes],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in holes],
         )
         if not check.ok:
             return JSONResponse(
@@ -374,11 +428,11 @@ def update_polygon(sid: str, pid: str, body: PolygonPatch) -> JSONResponse:
         check = measure_region(
             cal["H"],
             [[p["x"], p["y"]] for p in outer],
-            [[[p["x"], p["y"]] for p in h] for h in holes],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in holes],
         )
         if not check.ok:
             # Do NOT overwrite the last valid server-side geometry/result.
-            return _conflict_response(target, cal)
+            return _conflict_response(target, cal, check.errors)
     target["points"] = outer
     target["holes"] = holes
     if body.name:

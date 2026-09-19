@@ -96,6 +96,20 @@
           <div class="calib-status" id="calibStatus">
             <span class="dot dot-idle"></span><span>先上传照片，再依次点击矩形四角</span>
           </div>
+
+          <div class="sens-box">
+            <div class="sens-controls">
+              <label>角点误差半径 (px)
+                <input type="number" id="sensRadius" min="0.01" max="1000" step="any" value="1" />
+              </label>
+              <button class="btn" id="sensRun" disabled
+                title="对四角施加 128 组固定扰动，评估测量结果对标定误差的敏感程度">评估敏感性</button>
+            </div>
+            <p class="tip">在误差半径内对四个角点施加 <b>128 组可复现扰动</b>，逐组重算单应与全部区域；
+              各区域卡片显示面积/周长的 <b>P5–P95 区间</b>与有效样本覆盖率，覆盖率低于 80% 时
+              隐藏区间并提示重新标定。角点、误差半径或区域变化后，评估结果自动作废。</p>
+          </div>
+
           <p class="tip">按 <b>左上 → 右上 → 右下 → 左下</b> 顺序点击（与矩形朝向无关）。
             四角可随时拖动微调，标定结果实时更新。</p>
         </div>

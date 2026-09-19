@@ -94,15 +94,23 @@ check("poly perim .18", p1["valid"] and abs(p1["perimeter"] - 0.18) < 1e-9)
 check("empty holes echo", p1["holes"] == [])
 check("gross area mirrors area", abs(p1["gross_area"] - 0.002) < 1e-9)
 
-# self-intersecting polygon: region is stored, measurement invalid
+# self-intersecting polygon: rejected with 422, nothing stored
 bt = [project(0, 0), project(W, H), project(W, 0), project(0, H)]
 r = client.post(f"/api/sessions/{sid}/polygons",
                 json={"points": [{"x": float(u), "y": float(v)} for u, v in bt]})
-p2 = r.json()["polygon"]
-check("self-intersect stored invalid", p2["valid"] is False and "自交" in p2["errors"][0], p2["errors"])
+check("self-intersect add -> 422", r.status_code == 422, str(r.status_code))
+check("422 stores nothing", r.json()["polygon"] is None and "自交" in r.json()["detail"],
+      r.json().get("detail"))
 
-# update with a VALID triangle -> accepted: (0,0),(0.05,0),(0,0.03) area .00075
+# valid triangle: (0,0),(0.05,0),(0,0.03) -> area .00075
 tri = [project(0, 0), project(0.05, 0), project(0, 0.03)]
+r = client.post(f"/api/sessions/{sid}/polygons",
+                json={"points": [{"x": float(u), "y": float(v)} for u, v in tri]})
+check("triangle add 200", r.status_code == 200, str(r.status_code))
+p2 = r.json()["polygon"]
+check("triangle area .00075", p2["valid"] and abs(p2["area"] - 0.00075) < 1e-9, f"area={p2['area']}")
+
+# rename via PUT keeps the geometry
 r = client.put(f"/api/sessions/{sid}/polygons/{p2['id']}",
                json={"points": [{"x": float(u), "y": float(v)} for u, v in tri],
                      "name": "三角"})
@@ -135,8 +143,8 @@ reg_img = [project(0.01, 0.01), project(0.09, 0.01), project(0.09, 0.05), projec
 r = client.post(f"/api/sessions/{sid}/polygons", json={
     "name": "带孔区域",
     "points": [{"x": float(u), "y": float(v)} for u, v in reg_img],
-    "holes": [[{"x": float(u), "y": float(v)} for u, v in
-               [project(0.03, 0.02), project(0.05, 0.02), project(0.05, 0.04), project(0.03, 0.04)]]],
+    "holes": [{"points": [{"x": float(u), "y": float(v)} for u, v in
+                          [project(0.03, 0.02), project(0.05, 0.02), project(0.05, 0.04), project(0.03, 0.04)]]}],
 })
 check("holed region add", r.status_code == 200, str(r.status_code))
 ph = r.json()["polygon"]
@@ -149,8 +157,8 @@ check("one hole echoed", len(ph["holes"]) == 1 and abs(ph["holes"][0]["area"] - 
 phid = ph["id"]
 
 # hole crossing the outer boundary -> 422, last valid holed region retained
-bad_hole = [[{"x": float(u), "y": float(v)} for u, v in
-             [project(0.08, 0.04), project(0.095, 0.04), project(0.095, 0.055), project(0.08, 0.055)]]]
+bad_hole = [{"points": [{"x": float(u), "y": float(v)} for u, v in
+                        [project(0.08, 0.04), project(0.095, 0.04), project(0.095, 0.055), project(0.08, 0.055)]]}]
 r = client.put(f"/api/sessions/{sid}/polygons/{phid}", json={
     "points": [{"x": float(u), "y": float(v)} for u, v in reg_img],
     "holes": bad_hole,
@@ -163,10 +171,10 @@ check("last valid holes preserved", len(r.json()["polygon"]["holes"]) == 1)
 r = client.put(f"/api/sessions/{sid}/polygons/{phid}", json={
     "points": [{"x": float(u), "y": float(v)} for u, v in reg_img],
     "holes": [
-        [{"x": float(u), "y": float(v)} for u, v in
-         [project(0.02, 0.02), project(0.05, 0.02), project(0.05, 0.045), project(0.02, 0.045)]],
-        [{"x": float(u), "y": float(v)} for u, v in
-         [project(0.045, 0.025), project(0.07, 0.025), project(0.07, 0.045), project(0.045, 0.045)]],
+        {"points": [{"x": float(u), "y": float(v)} for u, v in
+                    [project(0.02, 0.02), project(0.05, 0.02), project(0.05, 0.045), project(0.02, 0.045)]]},
+        {"points": [{"x": float(u), "y": float(v)} for u, v in
+                    [project(0.045, 0.025), project(0.07, 0.025), project(0.07, 0.045), project(0.045, 0.045)]]},
     ],
 })
 check("overlapping holes 422", r.status_code == 422 and "孔洞" in r.json()["detail"])
@@ -175,10 +183,10 @@ check("overlapping holes 422", r.status_code == 422 and "孔洞" in r.json()["de
 r = client.put(f"/api/sessions/{sid}/polygons/{phid}", json={
     "points": [{"x": float(u), "y": float(v)} for u, v in reg_img],
     "holes": [
-        [{"x": float(u), "y": float(v)} for u, v in
-         [project(0.03, 0.02), project(0.05, 0.02), project(0.05, 0.04), project(0.03, 0.04)]],
-        [{"x": float(u), "y": float(v)} for u, v in
-         [project(0.06, 0.02), project(0.08, 0.02), project(0.08, 0.04), project(0.06, 0.04)]],
+        {"points": [{"x": float(u), "y": float(v)} for u, v in
+                    [project(0.03, 0.02), project(0.05, 0.02), project(0.05, 0.04), project(0.03, 0.04)]]},
+        {"points": [{"x": float(u), "y": float(v)} for u, v in
+                    [project(0.06, 0.02), project(0.08, 0.02), project(0.08, 0.04), project(0.06, 0.04)]]},
     ],
 })
 check("two-hole update 200", r.status_code == 200)
@@ -217,8 +225,14 @@ legacy = {
     "created_at": 0,
     "image": {"filename": "x.jpg", "width": 1024, "height": 768},
     "calibration": None,
-    "polygons": [{"id": "pold", "name": "旧区域",
-                  "points": [{"x": 1.0, "y": 1.0}, {"x": 2.0, "y": 1.0}, {"x": 2.0, "y": 2.0}]}],
+    "polygons": [
+        {"id": "pold", "name": "旧区域",
+         "points": [{"x": 1.0, "y": 1.0}, {"x": 2.0, "y": 1.0}, {"x": 2.0, "y": 2.0}]},
+        # early builds stored a hole as a bare point list, not {"points": [...]}
+        {"id": "pold2", "name": "旧带孔",
+         "points": [{"x": 0.0, "y": 0.0}, {"x": 3.0, "y": 0.0}, {"x": 3.0, "y": 3.0}],
+         "holes": [[{"x": 1.0, "y": 1.0}, {"x": 2.0, "y": 1.0}, {"x": 2.0, "y": 2.0}]]},
+    ],
 }
 (mainmod.SESS_DIR / f"{old_sid}.json").write_text(_json.dumps(legacy), encoding="utf-8")
 mainmod._load_sessions()
@@ -226,6 +240,9 @@ r = client.get(f"/api/sessions/{old_sid}")
 check("legacy session loads", r.status_code == 200)
 check("legacy polygon gets empty holes", r.json()["polygons"][0]["holes"] == [])
 check("legacy polygon measurable=false w/o calib", r.json()["polygons"][0]["valid"] is False)
+check("legacy bare-list holes normalized",
+      r.json()["polygons"][1]["holes"][0]["points"][0] == {"x": 1.0, "y": 1.0},
+      str(r.json()["polygons"][1]["holes"]))
 (mainmod.SESS_DIR / f"{old_sid}.json").unlink(missing_ok=True)
 mainmod._SESSIONS.pop(old_sid, None)
 
