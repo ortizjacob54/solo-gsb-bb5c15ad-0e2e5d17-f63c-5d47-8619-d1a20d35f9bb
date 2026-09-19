@@ -98,6 +98,22 @@
           </div>
           <p class="tip">按 <b>左上 → 右上 → 右下 → 左下</b> 顺序点击（与矩形朝向无关）。
             四角可随时拖动微调，标定结果实时更新。</p>
+
+          <div class="sens-box" id="sensBox">
+            <div class="sens-head">
+              <label class="sens-toggle">
+                <input type="checkbox" id="sensEnable" />
+                <span>标定敏感性评估</span>
+              </label>
+              <label class="sens-radius">角点误差半径
+                <input type="number" id="sensRadius" min="0" step="any" placeholder="如 2" disabled /> px
+              </label>
+            </div>
+            <p class="tip">为四个角点设置<b>统一的像素误差半径</b>：后端基于当前会话几何生成固定
+              128 组可复现扰动，逐组重算单应矩阵与全部区域，给出面积 / 周长的 P5/P50/P95。
+              角点、半径或区域变化后结果自动作废重算。</p>
+            <div class="sens-summary hidden" id="sensSummary"></div>
+          </div>
         </div>
       </section>
 

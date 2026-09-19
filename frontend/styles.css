@@ -211,6 +211,69 @@ input[type="number"]:focus, select:focus { border-color: var(--accent); }
 .dot-err { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .tip { font-size: 11.5px; color: var(--text-dim); line-height: 1.55; margin: 8px 0 0; }
 
+/* ---------------- calibration sensitivity ---------------- */
+.sens-box {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+}
+.sens-box.disabled { opacity: .65; }
+.sens-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.sens-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+.sens-toggle input { width: auto; accent-color: var(--accent); }
+.sens-radius {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.sens-radius input { width: 74px; padding: 5px 8px; font-size: 12px; }
+.sens-summary {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.sens-summary.hidden { display: none; }
+.sens-summary.sens-muted { color: var(--text-dim); border-color: var(--border); }
+.sens-summary.sens-ok { border-color: #33543f; background: #16231c; color: #bfe6cf; }
+.sens-summary.sens-bad { border-color: #8a4d2a; background: #2c2014; color: #ffe1c2; }
+.sens-warn { margin-top: 3px; font-weight: 600; }
+.sens-ok-text { color: #8fe0b8; margin-top: 2px; }
+
+.sens-block {
+  margin-top: 7px;
+  border-radius: 8px;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+}
+.sens-block.sens-muted { color: var(--text-dim); }
+.sens-block.sens-ok { border-color: #33543f; background: #16231c; color: #cdeedd; }
+.sens-block.sens-bad { border-color: #8a4d2a; background: #2c2014; color: #ffd9bb; font-weight: 600; }
+.sens-title { font-size: 10.5px; color: var(--text-dim); margin-bottom: 3px; }
+.sens-block.sens-ok .sens-title { color: #8fe0b8; }
+.sens-intervals { display: flex; flex-direction: column; gap: 1px; font-family: var(--mono); }
+.sens-intervals b { color: #eafff3; font-weight: 700; }
+.sens-intervals em { color: var(--text-dim); font-style: normal; font-size: 10.5px; margin-left: 4px; }
+
 /* ---------------- overlays ---------------- */
 .overlay {
   position: absolute;

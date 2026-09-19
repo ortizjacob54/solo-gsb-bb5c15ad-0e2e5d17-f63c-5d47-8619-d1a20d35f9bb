@@ -17,6 +17,9 @@ use.  The same numerical tolerances are mirrored by the frontend JavaScript
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -558,3 +561,196 @@ def measure_region(
         hole_world_points=rings_world[1:],
         gross_area=gross,
     )
+
+
+# ---------------------------------------------------------------------------
+# Calibration sensitivity (Monte-Carlo perturbation of the four corners)
+# ---------------------------------------------------------------------------
+#
+# The four calibration corners are perturbed jointly by a user-chosen pixel
+# error radius.  For each of SENSITIVITY_SAMPLES fixed, reproducible trials the
+# homography (and every region) is recomputed from scratch.  Degenerate
+# homographies, corners landing outside the photo and geometrically illegal
+# regions are *counted as failures* (never silently dropped): the response
+# carries the valid/total coverage so the UI can refuse to show intervals when
+# too many trials failed.
+SENSITIVITY_SAMPLES = 128
+SENSITIVITY_MIN_COVERAGE = 0.80
+
+
+class _SplitMix64:
+    """Deterministic 64-bit PRNG (pure Python, identical on every platform)."""
+
+    MASK = (1 << 64) - 1
+
+    def __init__(self, seed: int):
+        self.state = seed & self.MASK
+
+    def next_u64(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & self.MASK
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & self.MASK
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & self.MASK
+        return z ^ (z >> 31)
+
+    def next_unit(self) -> float:
+        # 53-bit mantissa -> [0, 1)
+        return (self.next_u64() >> 11) * (2.0 ** -53)
+
+
+def sensitivity_seed(corners: list[list[float]], width: float, height: float,
+                     radius: float) -> str:
+    """Stable hex seed for one (geometry + radius) configuration."""
+    payload = json.dumps(
+        {
+            "c": [[round(float(u), 6), round(float(v), 6)] for u, v in corners],
+            "w": round(float(width), 9),
+            "h": round(float(height), 9),
+            "r": round(float(radius), 6),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _disk_offsets(rng: _SplitMix64, radius: float) -> tuple[float, float]:
+    """Uniform sample inside the closed disk of pixel radius ``radius``."""
+    ang = 2.0 * math.pi * rng.next_unit()
+    rad = radius * math.sqrt(rng.next_unit())
+    return rad * math.cos(ang), rad * math.sin(ang)
+
+
+@dataclass
+class RegionSensitivity:
+    valid_samples: int
+    total_samples: int
+    area_p5: float | None
+    area_p50: float | None
+    area_p95: float | None
+    perimeter_p5: float | None
+    perimeter_p50: float | None
+    perimeter_p95: float | None
+    invalid_geometry_samples: int
+
+
+def _percentiles(values: list[float]) -> tuple[float, float, float]:
+    """P5 / P50 / P95 with numpy's default linear interpolation."""
+    arr = np.asarray(values, dtype=float)
+    p5, p50, p95 = np.percentile(arr, [5.0, 50.0, 95.0])
+    return float(p5), float(p50), float(p95)
+
+
+def assess_region_sensitivity(
+    H_matrices: list[list[list[float]] | None],
+    outer_image: list[list[float]],
+    holes_image: list[list[list[float]]],
+) -> RegionSensitivity:
+    """Re-measure one region over the successful-homography trial set.
+
+    ``H_matrices`` has one entry per trial: ``None`` when that trial's
+    calibration failed (out-of-bounds corner or degenerate homography); such
+    trials count against coverage.  A region that becomes illegal (self
+    intersection, hole escapes the outer ring, point near the line at
+    infinity, non-finite numbers) is a failed trial too — it is never dropped.
+    """
+    total = len(H_matrices)
+    areas: list[float] = []
+    perimeters: list[float] = []
+    invalid_geom = 0
+    for H in H_matrices:
+        if H is None:
+            continue
+        r = measure_region(H, outer_image, holes_image)
+        if not r.ok or not (math.isfinite(r.area) and math.isfinite(r.perimeter)):
+            invalid_geom += 1
+            continue
+        areas.append(r.area)
+        perimeters.append(r.perimeter)
+
+    valid = len(areas)
+    if areas:
+        a5, a50, a95 = _percentiles(areas)
+        l5, l50, l95 = _percentiles(perimeters)
+    else:
+        a5 = a50 = a95 = l5 = l50 = l95 = None
+    return RegionSensitivity(
+        valid_samples=valid,
+        total_samples=total,
+        area_p5=a5, area_p50=a50, area_p95=a95,
+        perimeter_p5=l5, perimeter_p50=l50, perimeter_p95=l95,
+        invalid_geometry_samples=invalid_geom,
+    )
+
+
+def run_sensitivity(
+    corners: list[list[float]],
+    width: float,
+    height: float,
+    radius: float,
+    regions: list[tuple[list[list[float]], list[list[list[float]]]]],
+    img_w: float | None = None,
+    img_h: float | None = None,
+) -> dict:
+    """Run the fixed 128-trial calibration-sensitivity assessment.
+
+    Parameters
+    ----------
+    corners:
+        The four current calibration corners (image pixels), order
+        TL -> TR -> BR -> BL.
+    width, height:
+        Known real dimensions of the calibration rectangle.
+    radius:
+        Uniform pixel error radius applied to every corner (>= 0).
+    regions:
+        Stored regions as ``(outer_image_points, [hole_image_points, ...])``.
+    img_w, img_h:
+        Photo size.  When given, trials pushing a corner outside the photo
+        (strictly past its borders) are classified as out-of-bounds failures
+        and counted, never retried.
+
+    The perturbation stream derives from :func:`sensitivity_seed`, so the same
+    session geometry + radius always reproduce the exact same 128 trials.
+    """
+    n = SENSITIVITY_SAMPLES
+    seed = sensitivity_seed(corners, width, height, radius)
+    rng = _SplitMix64(int(seed[:16], 16))
+
+    H_matrices: list[list[list[float]] | None] = []
+    out_of_bounds = 0
+    degenerate = 0
+    for _ in range(n):
+        trial_corners = []
+        for u, v in corners:
+            du, dv = _disk_offsets(rng, radius)
+            trial_corners.append([u + du, v + dv])
+        if img_w is not None and img_h is not None and any(
+            not (0.0 <= u <= img_w and 0.0 <= v <= img_h)
+            for u, v in trial_corners
+        ):
+            out_of_bounds += 1
+            H_matrices.append(None)
+            continue
+        res = solve_homography(trial_corners, width, height)
+        if not res.ok:
+            degenerate += 1
+            H_matrices.append(None)
+            continue
+        H_matrices.append(res.H)
+
+    region_results = [
+        assess_region_sensitivity(H_matrices, outer, holes)
+        for outer, holes in regions
+    ]
+    return {
+        "samples": n,
+        "radius_px": float(radius),
+        "seed": seed,
+        "out_of_bounds_samples": out_of_bounds,
+        "degenerate_samples": degenerate,
+        "homography_valid_samples": n - out_of_bounds - degenerate,
+        "min_coverage": SENSITIVITY_MIN_COVERAGE,
+        "regions": region_results,
+    }

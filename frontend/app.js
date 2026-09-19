@@ -467,6 +467,14 @@ const state = {
   hoverImg: null,
   dragging: null,         // drag descriptor
   spaceDown: false,
+  // Calibration sensitivity assessment (Monte-Carlo corner perturbation).
+  sensEnabled: false,
+  sensRadius: null,       // number | null; persisted server-side when set
+  sensResult: null,       // latest response keyed to current geometry, or null
+  sensSig: null,          // geometry signature the result was computed for
+  sensLoading: false,
+  sensSeq: 0,
+  sensTimer: null,
 };
 
 const COLORS = ["#4da3ff", "#3ddc97", "#ffc24d", "#ff8f6b", "#c792ea",
@@ -848,6 +856,7 @@ function renderPolyList() {
     const lv = poly.lastValid;
     const showLast = invalidNow && lv && lv.valid;
     card.className = "poly-card" + (poly.id === state.selected ? " selected" : "") + (invalidNow ? " invalid" : "");
+    card.dataset.polyId = poly.id;
     const areaConv = convertValue(poly.area, state.unit, state.displayUnit, true);
     const perConv = convertValue(poly.perimeter, state.unit, state.displayUnit, false);
     const lvArea = showLast ? convertValue(lv.area, state.unit, state.displayUnit, true) : null;
@@ -920,7 +929,7 @@ function renderPolyList() {
     });
     card.querySelector(".poly-name").addEventListener("change", (e) => {
       poly.name = e.target.value.trim() || poly.name;
-      if (poly.valid) syncPolygon(poly);
+      if (poly.valid) syncPolygon(poly, { nameOnly: true });
     });
     list.appendChild(card);
   });
@@ -991,6 +1000,7 @@ function refreshUI() {
   renderPolyList();
   renderModeButtons();
   updateUnitOptions();
+  updateSensitivityPanels();
   render();
 }
 
@@ -1026,6 +1036,12 @@ async function recomputeCalibration({ push = true } = {}) {
   }
   recomputePolygonMetrics();
 
+  // Corner / reference-dimension movement invalidates any prior assessment.
+  // During a live drag (push=false) the server still holds the previous
+  // calibration, so we must NOT schedule a run against that stale geometry;
+  // the pointer-up PUT triggers a fresh, correct run.
+  invalidateSensitivity({ refetch: push });
+
   const seq = ++calibSeq;
   if (push && state.corners.length === 4 && dimsValid) {
     try {
@@ -1044,8 +1060,11 @@ async function recomputeCalibration({ push = true } = {}) {
       state.H = data.calibration.H;
       state.calibErrors = data.calibration.errors || [];
       mergeServerPolygons(data.polygons);
+      // Geometry is now authoritative: rerun the assessment against it.
+      invalidateSensitivity({ refetch: true });
     } catch (err) {
-      if (seq === calibSeq) toast("标定同步失败（本地结果仍显示）：" + err.message, true);
+      if (seq !== calibSeq) return;
+      toast("标定同步失败（本地结果仍显示）：" + err.message, true);
     }
   }
   els.modeDraw.disabled = !state.calibValid;
@@ -1132,6 +1151,175 @@ function recomputePolygonMetrics() {
   }
 }
 
+/* ======================================================== sensitivity ==== *
+ * Fixed 128-trial corner-perturbation assessment runs on the server, so the
+ * perturbation set is reproducible there.  Any change to corners, radius or
+ * region geometry invalidates the previous result immediately; a debounced
+ * refetch replaces it.  Trials whose homography degenerates, whose perturbed
+ * corner leaves the photo, or whose region becomes illegal count as failures
+ * server-side; when valid coverage is below 80% no interval is shown.
+ */
+function sensitivitySignature() {
+  return JSON.stringify({
+    c: state.corners.map((p) => [Math.round(p.x * 1000), Math.round(p.y * 1000)]),
+    w: state.rectW, h: state.rectH,
+    r: state.sensRadius == null ? null : Number(state.sensRadius),
+    p: state.polygons.map(polyGeometrySignature),
+  });
+}
+
+function sensEntryFor(polyId) {
+  const res = state.sensResult;
+  if (!res || res._sig !== state.sensSig) return null;
+  return (res.regions || []).find((r) => r.id === polyId) || null;
+}
+
+/** Immediately retire any assessment that no longer matches the geometry and
+ *  (re)schedule a server run when appropriate. Safe to call repeatedly.
+ *  Any invalidation also supersedes in-flight responses (they used an older
+ *  server-side calibration), so a stale answer can never be displayed. */
+function invalidateSensitivity({ refetch = true } = {}) {
+  state.sensSeq += 1;
+  state.sensResult = null;
+  state.sensSig = null;
+  state.sensLoading = false;
+  clearTimeout(state.sensTimer);
+  state.sensTimer = null;
+  updateSensitivityPanels();
+  if (refetch) scheduleSensitivity();
+}
+
+function scheduleSensitivity() {
+  clearTimeout(state.sensTimer);
+  const ready =
+    state.sensEnabled &&
+    state.sensRadius != null && isFinite(state.sensRadius) && state.sensRadius >= 0 &&
+    state.calibValid && state.polygons.length > 0;
+  if (!ready) {
+    updateSensitivityPanels();
+    return;
+  }
+  state.sensLoading = true;
+  updateSensitivityPanels();
+  const sig = sensitivitySignature();
+  state.sensTimer = setTimeout(() => {
+    state.sensTimer = null;
+    void runSensitivity(sig);
+  }, 300);
+}
+
+async function runSensitivity(sig) {
+  const seq = ++state.sensSeq;
+  try {
+    const res = await api(`/api/sessions/${state.sessionId}/sensitivity`, {
+      method: "POST",
+      body: JSON.stringify({ radius_px: state.sensRadius }),
+    });
+    if (seq !== state.sensSeq) return;          // a newer run superseded this one
+    state.sensResult = res;
+    state.sensResult._sig = sig;
+    state.sensSig = sig;
+    state.sensLoading = false;
+    updateSensitivityPanels();
+  } catch (err) {
+    if (seq !== state.sensSeq) return;
+    state.sensLoading = false;
+    state.sensResult = null;
+    state.sensSig = null;
+    updateSensitivityPanels();
+    toast("标定敏感性评估失败：" + err.message, true);
+  }
+}
+
+function fmtPct(v, fromUnit, toUnit, isArea) {
+  const c = convertValue(v, fromUnit, toUnit, isArea);
+  return c == null ? "—" : fmtNum(c);
+}
+
+/** Render the calibration-panel summary and the interval block inside every
+ *  existing result card. Cheap enough to call on every geometry bump. */
+function updateSensitivityPanels() {
+  const box = els.sensBox;
+  if (box) box.classList.toggle("disabled", !state.calibValid);
+  const radiusInput = els.sensRadius;
+  if (radiusInput) radiusInput.disabled = !state.sensEnabled || !state.calibValid;
+  if (els.sensEnable) els.sensEnable.checked = !!state.sensEnabled;
+
+  // --- summary in the calibration panel ---
+  const sum = els.sensSummary;
+  if (sum) {
+    if (!state.sensEnabled) {
+      sum.classList.add("hidden");
+      sum.innerHTML = "";
+    } else if (!state.calibValid) {      sum.classList.remove("hidden");
+      sum.className = "sens-summary sens-muted";
+      sum.innerHTML = `完成有效标定后，将以 <b>${escapeHtml(fmtNum(state.sensRadius ?? 0))} px</b> 误差半径评估。`;
+    } else if (state.polygons.length === 0) {
+      sum.classList.remove("hidden");
+      sum.className = "sens-summary sens-muted";
+      sum.textContent = "绘制至少一个区域后开始评估。";
+    } else if (state.sensLoading || !state.sensResult) {
+      sum.classList.remove("hidden");
+      sum.className = "sens-summary sens-muted";
+      sum.textContent = "正在以 128 组固定扰动重算全部区域…";
+    } else {
+      const r = state.sensResult;
+      sum.classList.remove("hidden");
+      const bad = (r.regions || []).filter((x) => !x.intervals_shown);
+      sum.className = "sens-summary " + (bad.length ? "sens-bad" : "sens-ok");
+      sum.innerHTML =
+        `<div>误差半径 <b>${escapeHtml(fmtNum(r.radius_px))} px</b> · 固定 ${r.samples} 组扰动 · ` +
+        `单应有效 <b>${r.homography_valid_samples}/${r.samples}</b>` +
+        (r.out_of_bounds_samples ? ` · 越界 ${r.out_of_bounds_samples}` : "") +
+        (r.degenerate_samples ? ` · 退化 ${r.degenerate_samples}` : "") + `</div>` +
+        (bad.length
+          ? `<div class="sens-warn">⚠ ${bad.length} 个区域有效样本低于 80%，已隐藏区间——请重新标定（放大参照物、角点远离照片边缘、精确点击四角）。</div>`
+          : `<div class="sens-ok-text">全部区域有效样本 ≥ 80%，P5–P95 区间见结果卡片。</div>`);
+    }
+  }
+
+  // --- per-card interval blocks ---
+  const cards = els.polyList ? els.polyList.querySelectorAll(".poly-card") : [];
+  cards.forEach((card) => {
+    let block = card.querySelector(".sens-block");
+    const entry = state.sensEnabled ? sensEntryFor(card.dataset.polyId) : null;
+    if (!state.sensEnabled) {
+      if (block) block.remove();
+      return;
+    }
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "sens-block";
+      const anchor = card.querySelector(".poly-actions") || card.lastElementChild;
+      card.insertBefore(block, anchor);
+    }
+    const areaUnit = state.displayUnit === "px" ? "px²" : `${state.displayUnit}²`;
+    if (!state.calibValid || state.polygons.length === 0) {
+      block.className = "sens-block sens-muted";
+      block.textContent = "敏感性：完成标定并绘制区域后可用";
+    } else if (state.sensLoading || !state.sensResult || !entry) {
+      block.className = "sens-block sens-muted";
+      block.textContent = "敏感性区间计算中…";
+    } else if (!entry.intervals_shown) {
+      block.className = "sens-block sens-bad";
+      block.textContent = "敏感性：" + entry.note;
+    } else {
+      block.className = "sens-block sens-ok";
+      block.innerHTML =
+        `<div class="sens-title">标定敏感性（误差半径 ${escapeHtml(fmtNum(state.sensResult.radius_px))} px · ` +
+        `覆盖率 ${Math.round(entry.coverage * 100)}% · ${entry.valid_samples}/${entry.total_samples} 组有效）</div>` +
+        `<div class="sens-intervals">` +
+        `<span>净面积 <b>${fmtPct(entry.area_p5, state.unit, state.displayUnit, true)}</b> – ` +
+        `<b>${fmtPct(entry.area_p95, state.unit, state.displayUnit, true)}</b> ${areaUnit}` +
+        ` <em>P50 ${fmtPct(entry.area_p50, state.unit, state.displayUnit, true)}</em></span>` +
+        `<span>总周长 <b>${fmtPct(entry.perimeter_p5, state.unit, state.displayUnit, false)}</b> – ` +
+        `<b>${fmtPct(entry.perimeter_p95, state.unit, state.displayUnit, false)}</b> ${state.displayUnit}` +
+        ` <em>P50 ${fmtPct(entry.perimeter_p50, state.unit, state.displayUnit, false)}</em></span>` +
+        `</div>`;
+    }
+  });
+}
+
 /* ============================================================ polygons === */
 function hydratePolygon(sp) {
   return {
@@ -1175,12 +1363,13 @@ async function addPolygon(points, holes = [], name) {
   els.modeDrawAnother.disabled = false;
   els.clearPolys.disabled = false;
   setMode("edit");
+  invalidateSensitivity();
   refreshUI();
   return poly;
 }
 
 const syncTimers = new Map();
-function syncPolygon(poly) {
+function syncPolygon(poly, { nameOnly = false } = {}) {
   clearTimeout(syncTimers.get(poly.id));
   const timer = setTimeout(async () => {
     syncTimers.delete(poly.id);
@@ -1197,6 +1386,9 @@ function syncPolygon(poly) {
         }),
       });
       adoptServerPolygon(poly, r.polygon);
+      // Only a real geometry change retires the assessment; a rename leaves
+      // the geometry signature (and the intervals) untouched.
+      if (!nameOnly) invalidateSensitivity();
       refreshUI();
     } catch (err) {
       if (err.status === 422 && err.data?.polygon) {
@@ -1207,6 +1399,7 @@ function syncPolygon(poly) {
         poly.holes = (sp.holes || []).map((h) => ({ points: h.points.map((q) => ({ x: q.x, y: q.y })) }));
         adoptServerPolygon(poly, sp);
         poly.lastValid = makeLastValid(poly);
+        invalidateSensitivity();
         showNotice("服务端拒绝了该非法几何，已恢复为最后一次有效结果：" + (sp.errors || []).join("；"), true);
         refreshUI();
       } else {
@@ -1225,6 +1418,7 @@ function revertPolygon(id) {
   recomputePolygonMetrics();
   poly.lastValid = poly.valid ? makeLastValid(poly) : poly.lastValid;
   if (poly.valid) syncPolygon(poly);
+  invalidateSensitivity();
   showNotice(null);
   refreshUI();
 }
@@ -1235,6 +1429,7 @@ async function deleteHole(polyId, holeIndex) {
   poly.holes.splice(holeIndex, 1);
   recomputePolygonMetrics();
   if (poly.valid) syncPolygon(poly);
+  invalidateSensitivity();
   refreshUI();
 }
 
@@ -1256,6 +1451,7 @@ async function deletePolygon(id) {
   els.modeHole.disabled = state.polygons.length === 0;
   els.modeDrawAnother.disabled = !state.calibValid;
   els.clearPolys.disabled = state.polygons.length === 0;
+  invalidateSensitivity();
   refreshUI();
 }
 
@@ -1462,6 +1658,10 @@ $canvas.addEventListener("pointermove", (e) => {
     poly.holes = d.origHoles.map((hpts) => hpts.map((p) => clampImagePoint({ x: p.x + dx, y: p.y + dy })));
   }
   recomputePolygonMetrics();
+  // The moment region geometry moves, the previous intervals are stale.
+  // Do not refetch mid-drag: the server still stores the pre-drag geometry;
+  // pointer-up's syncPolygon() triggers the authoritative rerun.
+  invalidateSensitivity({ refetch: false });
   render();
   updatePolyCardMetrics();
 });
@@ -1512,6 +1712,7 @@ $canvas.addEventListener("contextmenu", (e) => {
         ringPts.splice(hv.vertex, 1);
         recomputePolygonMetrics();
         if (poly.valid) syncPolygon(poly);
+        invalidateSensitivity();
         refreshUI();
       }
     }
@@ -1557,6 +1758,7 @@ function finishHoleDraft() {
   applyLiveMetrics(target, m);
   target.lastValid = makeLastValid(target);
   syncPolygon(target);
+  invalidateSensitivity();
   state.selected = target.id;
   showNotice(`已为「${target.name}」添加孔洞 ${target.holes.length}：面积与周长已实时重算`);
   setMode("edit");
@@ -1645,6 +1847,7 @@ els.clearCorners.addEventListener("click", () => {
   state.calibValid = false;
   state.calibErrors = [];
   recomputePolygonMetrics();
+  invalidateSensitivity();
   els.modeDraw.disabled = true;
   els.modeHole.disabled = state.polygons.length === 0;
   setMode("calib");
@@ -1666,6 +1869,7 @@ els.clearPolys.addEventListener("click", async () => {
   els.modeHole.disabled = true;
   els.modeDrawAnother.disabled = !state.calibValid;
   els.clearPolys.disabled = true;
+  invalidateSensitivity();
   setMode(state.calibValid ? "draw" : "calib");
   refreshUI();
 });
@@ -1708,6 +1912,27 @@ els.rectUnit.addEventListener("change", () => {
 els.displayUnit.addEventListener("change", () => {
   state.displayUnit = els.displayUnit.value;
   renderPolyList();
+  updateSensitivityPanels();
+});
+
+/* ------------------------------------------------------- sensitivity UI - */
+els.sensEnable.addEventListener("change", () => {
+  state.sensEnabled = els.sensEnable.checked;
+  els.sensRadius.disabled = !state.sensEnabled || !state.calibValid;
+  if (state.sensEnabled) {
+    const v = parseFloat(els.sensRadius.value);
+    state.sensRadius = isFinite(v) && v >= 0 ? v : (state.sensRadius ?? null);
+  }
+  // Toggling on starts a fresh run; toggling off retires any stored result.
+  invalidateSensitivity();
+});
+
+els.sensRadius.addEventListener("input", () => {
+  const v = parseFloat(els.sensRadius.value);
+  if (!isFinite(v) || v < 0) return;
+  state.sensRadius = v;
+  // The radius is part of the perturbation seed: old intervals are stale.
+  invalidateSensitivity();
 });
 
 /* ============================================================ upload ===== */
@@ -1756,6 +1981,11 @@ function hydrateSession(s) {
   } else {
     resetUI();
   }
+  // Restore the persisted assessment configuration (old sessions have none).
+  state.sensRadius = s.sensitivity_radius == null ? null : Number(s.sensitivity_radius);
+  state.sensEnabled = state.sensRadius != null;
+  els.sensRadius.value = state.sensRadius ?? "";
+  els.sensEnable.checked = state.sensEnabled;
   els.modeDraw.disabled = !state.calibValid;
   els.modeEdit.disabled = state.polygons.length === 0;
   els.modeHole.disabled = !state.calibValid || state.polygons.length === 0;
@@ -1764,6 +1994,8 @@ function hydrateSession(s) {
   els.exportBtn.disabled = !s.image;
   state.displayUnit = state.unit;
   setMode(state.calibValid ? (state.polygons.length ? "edit" : "draw") : "calib");
+  // Persisted config + stored geometry -> recompute the reproducible trials.
+  invalidateSensitivity();
   refreshUI();
 }
 
@@ -1779,6 +2011,11 @@ function resetUI() {
   state.holeDraft = [];
   state.holeTarget = null;
   state.selected = null;
+  state.sensResult = null;
+  state.sensSig = null;
+  state.sensLoading = false;
+  clearTimeout(state.sensTimer);
+  els.sensRadius.value = "";
   els.exportBtn.disabled = true;
   els.emptyOverlay.classList.remove("hidden");
 }
@@ -1819,6 +2056,15 @@ async function uploadFile(file) {
   state.holeDraft = [];
   state.holeTarget = null;
   state.selected = null;
+  // A new photo wipes all geometry; the assessment configuration resets too.
+  state.sensEnabled = false;
+  state.sensRadius = null;
+  state.sensResult = null;
+  state.sensSig = null;
+  state.sensLoading = false;
+  clearTimeout(state.sensTimer);
+  els.sensEnable.checked = false;
+  els.sensRadius.value = "";
   els.rectW.value = ""; els.rectH.value = "";
   state.rectW = null; state.rectH = null;
   els.modeDraw.disabled = true;
@@ -1828,6 +2074,7 @@ async function uploadFile(file) {
   els.clearPolys.disabled = true;
   loadImage(data.image.filename);
   setMode("calib");
+  invalidateSensitivity();
   refreshUI();
   toast("照片已上传，请标记已知矩形的四个角点");
 }

@@ -22,7 +22,14 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from .geometry import HomographyResult, measure_region, solve_homography
+from .geometry import (
+    HomographyResult,
+    SENSITIVITY_MIN_COVERAGE,
+    SENSITIVITY_SAMPLES,
+    measure_region,
+    run_sensitivity,
+    solve_homography,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 # backend/app/main.py -> parents: backend/, workspace/
@@ -61,6 +68,9 @@ def _load_sessions() -> None:
             # no "holes" key on polygon records.
             for poly in s.get("polygons", []):
                 poly.setdefault("holes", [])
+            # Sessions saved before calibration-sensitivity analysis existed
+            # have no stored error radius; they simply show no assessment.
+            s.setdefault("sensitivity_radius", None)
             _SESSIONS[s["id"]] = s
         except (json.JSONDecodeError, KeyError):
             continue
@@ -90,6 +100,11 @@ class CalibrationIn(BaseModel):
     rect_width: float = Field(..., gt=0)
     rect_height: float = Field(..., gt=0)
     unit: str = Field("mm", min_length=1, max_length=16)
+
+
+class SensitivityIn(BaseModel):
+    # Unified pixel error radius applied to all four calibration corners.
+    radius_px: float = Field(..., ge=0, le=100000)
 
 
 MAX_HOLES = 50
@@ -197,6 +212,7 @@ def create_session() -> dict[str, Any]:
         "image": None,
         "calibration": None,
         "polygons": [],
+        "sensitivity_radius": None,
     }
     with _LOCK:
         _SESSIONS[sid] = s
@@ -214,6 +230,7 @@ def get_session(sid: str) -> dict[str, Any]:
             "image": s["image"],
             "calibration": _cal_payload(s),
             "polygons": [_measure_payload(p, cal) for p in s["polygons"]],
+            "sensitivity_radius": s.get("sensitivity_radius"),
         }
 
 @app.post("/api/sessions/{sid}/image")
@@ -244,6 +261,7 @@ async def upload_image(sid: str, file: UploadFile) -> dict[str, Any]:
         s["image"] = {"filename": name, "width": img.width, "height": img.height}
         s["calibration"] = None
         s["polygons"] = []
+        s["sensitivity_radius"] = None
         _save_session(s)
     return {"image": s["image"]}
 
@@ -291,6 +309,109 @@ def set_calibration(sid: str, body: CalibrationIn) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Calibration sensitivity
+# ---------------------------------------------------------------------------
+
+def _sensitivity_payload(s: dict[str, Any], cal: dict[str, Any],
+                         result: dict[str, Any]) -> dict[str, Any]:
+    """Serialize a sensitivity run, keyed per stored region id."""
+    region_entries: list[dict[str, Any]] = []
+    any_unreliable = False
+    for poly, rs in zip(s["polygons"], result["regions"]):
+        coverage = rs.valid_samples / result["samples"] if result["samples"] else 0.0
+        show = coverage >= SENSITIVITY_MIN_COVERAGE
+        if not show:
+            any_unreliable = True
+        entry = {
+            "id": poly["id"],
+            "valid_samples": rs.valid_samples,
+            "total_samples": rs.total_samples,
+            "coverage": coverage,
+            "invalid_geometry_samples": rs.invalid_geometry_samples,
+            "intervals_shown": show,
+            "note": "" if show else (
+                f"扰动有效样本仅 {rs.valid_samples}/{rs.total_samples}"
+                f"（{coverage * 100:.0f}%，低于 {int(SENSITIVITY_MIN_COVERAGE * 100)}% 门槛），"
+                "区间不可信，请重新标定（放大参照物、避免边缘角点、精确点击四角）"
+            ),
+        }
+        if show:
+            entry.update(
+                area_p5=rs.area_p5,
+                area_p50=rs.area_p50,
+                area_p95=rs.area_p95,
+                perimeter_p5=rs.perimeter_p5,
+                perimeter_p50=rs.perimeter_p50,
+                perimeter_p95=rs.perimeter_p95,
+            )
+        else:
+            entry.update(
+                area_p5=None, area_p50=None, area_p95=None,
+                perimeter_p5=None, perimeter_p50=None, perimeter_p95=None,
+            )
+        region_entries.append(entry)
+
+    return {
+        "radius_px": result["radius_px"],
+        "samples": result["samples"],
+        "seed": result["seed"],
+        "out_of_bounds_samples": result["out_of_bounds_samples"],
+        "degenerate_samples": result["degenerate_samples"],
+        "homography_valid_samples": result["homography_valid_samples"],
+        "min_coverage": SENSITIVITY_MIN_COVERAGE,
+        "all_intervals_shown": not any_unreliable,
+        "recompute_hint": (
+            "" if not any_unreliable else
+            "存在有效样本比例低于 80% 的区域，已隐藏其区间，请重新标定"
+        ),
+        "regions": region_entries,
+    }
+
+
+@app.post("/api/sessions/{sid}/sensitivity")
+def run_sensitivity_assessment(sid: str, body: SensitivityIn) -> dict[str, Any]:
+    """Run the fixed, reproducible 128-trial corner-perturbation assessment.
+
+    Every trial perturbs each of the four corners by the same pixel error
+    radius, recomputes the homography and re-measures every stored region.
+    Out-of-bounds corners, degenerate homographies and geometrically illegal
+    region trials are counted as failures rather than discarded.
+    """
+    s = _get(sid)
+    if not s.get("image"):
+        raise HTTPException(status_code=400, detail="请先上传照片")
+    cal = s.get("calibration")
+    if not (cal and cal.get("valid") and cal.get("H")):
+        raise HTTPException(status_code=400, detail="请先完成有效的透视标定")
+
+    corners = [[c["x"], c["y"]] for c in cal["corners"]]
+    regions = [
+        (
+            [[p["x"], p["y"]] for p in poly["points"]],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in poly.get("holes", [])],
+        )
+        for poly in s["polygons"]
+    ]
+    with _LOCK:
+        result = run_sensitivity(
+            corners,
+            cal["rect_width"],
+            cal["rect_height"],
+            body.radius_px,
+            regions,
+            img_w=s["image"]["width"],
+            img_h=s["image"]["height"],
+        )
+        payload = _sensitivity_payload(s, cal, result)
+        # Persist the chosen radius so a page reload / container restart keeps
+        # the assessment configuration; the trials themselves are derived and
+        # are recomputed on demand.
+        s["sensitivity_radius"] = float(body.radius_px)
+        _save_session(s)
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Polygons
 # ---------------------------------------------------------------------------
 
@@ -303,18 +424,23 @@ def _validate_points_in_image(s: dict[str, Any], points: list[Point], what: str 
             raise HTTPException(status_code=400, detail=f"{what} {i + 1} 超出图像范围")
 
 
-def _rings_from_body(body: PolygonIn | PolygonPatch) -> tuple[list[dict[str, float]], list[list[dict[str, float]]]]:
+def _rings_from_body(body: PolygonIn | PolygonPatch) -> tuple[list[dict[str, float]], list[dict[str, Any]]]:
     outer = [{"x": p.x, "y": p.y} for p in body.points]
-    holes = [[{"x": q.x, "y": q.y} for q in ring.points] for ring in (body.holes or [])]
+    # Stored hole records keep the same {"points": [...]} shape as the API.
+    holes = [{"points": [{"x": q.x, "y": q.y} for q in ring.points]} for ring in (body.holes or [])]
     return outer, holes
 
 
-def _conflict_response(poly: dict[str, Any], cal: dict[str, Any] | None) -> JSONResponse:
+def _conflict_response(poly: dict[str, Any], cal: dict[str, Any] | None,
+                       errors: list[str] | None = None) -> JSONResponse:
     """422 with the conflict detail and the last valid server-side result."""
     m = _measure_payload(poly, cal)
+    # The rejected edit's geometry produced ``errors``; the echoed polygon
+    # below remains the last *valid* server-side geometry.
+    detail_errors = errors if errors is not None else m["errors"]
     return JSONResponse(
         status_code=422,
-        content={"detail": "非法几何：" + "；".join(m["errors"]), "polygon": m},
+        content={"detail": "非法几何：" + "；".join(detail_errors), "polygon": m},
     )
 
 
@@ -337,7 +463,7 @@ def add_polygon(sid: str, body: PolygonIn) -> JSONResponse:
         check = measure_region(
             cal["H"],
             [[p["x"], p["y"]] for p in outer],
-            [[[p["x"], p["y"]] for p in h] for h in holes],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in holes],
         )
         if not check.ok:
             return JSONResponse(
@@ -374,11 +500,11 @@ def update_polygon(sid: str, pid: str, body: PolygonPatch) -> JSONResponse:
         check = measure_region(
             cal["H"],
             [[p["x"], p["y"]] for p in outer],
-            [[[p["x"], p["y"]] for p in h] for h in holes],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in holes],
         )
         if not check.ok:
             # Do NOT overwrite the last valid server-side geometry/result.
-            return _conflict_response(target, cal)
+            return _conflict_response(target, cal, check.errors)
     target["points"] = outer
     target["holes"] = holes
     if body.name:
@@ -412,6 +538,40 @@ def clear_polygons(sid: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
+
+def _sensitivity_export(s: dict[str, Any], cal: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Include the last sensitivity assessment in the export snapshot.
+
+    The radius is user configuration (persisted); the 128 trials are derived,
+    so they are recomputed here from the stored geometry.  Nothing is saved.
+    """
+    radius = s.get("sensitivity_radius")
+    if radius is None:
+        return None
+    if not (s.get("image") and cal and cal.get("valid") and cal.get("H")):
+        return {
+            "radius_px": float(radius),
+            "samples": SENSITIVITY_SAMPLES,
+            "available": False,
+            "reason": "当前标定无效，敏感性评估暂不可用",
+            "regions": [],
+        }
+    corners = [[c["x"], c["y"]] for c in cal["corners"]]
+    regions = [
+        (
+            [[p["x"], p["y"]] for p in poly["points"]],
+            [[[p["x"], p["y"]] for p in h["points"]] for h in poly.get("holes", [])],
+        )
+        for poly in s["polygons"]
+    ]
+    result = run_sensitivity(
+        corners, cal["rect_width"], cal["rect_height"], float(radius), regions,
+        img_w=s["image"]["width"], img_h=s["image"]["height"],
+    )
+    payload = _sensitivity_payload(s, cal, result)
+    payload["available"] = True
+    return payload
+
 
 @app.get("/api/sessions/{sid}/export")
 def export_session(sid: str) -> JSONResponse:
@@ -467,6 +627,7 @@ def export_session(sid: str) -> JSONResponse:
             }
             if cal else None
         ),
+        "sensitivity": _sensitivity_export(s, cal),
         "all_measurements_valid": all_ok,
         "polygons": polygons,
     }

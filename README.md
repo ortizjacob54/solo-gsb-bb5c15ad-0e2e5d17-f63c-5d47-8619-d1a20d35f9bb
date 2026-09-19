@@ -15,6 +15,8 @@
 - 前端：原生 HTML / CSS / JavaScript，Canvas 渲染，零构建、零前端框架
 - 所有几何点以**原始图像像素坐标**存储，缩放 / 平移 / 拖动顶点不改变测量几何
 - 前后端使用同一套数值算法（镜像实现），浏览器实时预览，服务器权威复核
+- **标定敏感性评估**：给四个角点设置统一像素误差半径，后端用固定 128 组可复现
+  扰动重算单应矩阵与全部区域，输出面积 / 周长的 P5/P50/P95 与有效样本比例
 
 ## 一条命令启动
 
@@ -33,7 +35,9 @@ docker compose up -d --build
 
 > 持久化与会话兼容：区域（含孔洞环）以 JSON 保存在 `data/sessions/`。
 > 升级前保存的**旧会话没有孔洞字段，加载时自动按“无孔洞区域”处理**，
-> 旧测量结果不受影响。
+> 旧测量结果不受影响；**旧会话也没有 `sensitivity_radius` 字段，加载时按
+> “从未启用敏感性评估”处理（`null`）**，需要时勾选并填入半径即可重新评估。
+> Docker 启动方式、卷挂载与端口均保持不变。
 
 停止：
 
@@ -80,6 +84,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 每个区域可重命名、单独删除；“清空区域”一键全部重画。
 6. **导出**：点击“导出 JSON”，下载本次全部测量结果（含单应矩阵、图像坐标、
    校正后坐标、外环与每个孔洞的面积周长、净面积及校验状态）。
+7. **标定敏感性评估**（可选）：
+   - 在第 1 步面板勾选「标定敏感性评估」，填入四个角点**统一的像素误差半径**
+     （如 `2` px，表示每个角点的真实位置可能落在以点击点为圆心、半径 2 px 的圆内）；
+   - 后端基于**当前会话几何**生成**固定 128 组**扰动（角点坐标、参照物宽高、
+     半径共同决定随机种子，因此结果**可复现**：同样的几何与半径永远得到同样的
+     128 组扰动），逐组重新求解单应矩阵并复算所有区域；
+   - 每个区域结果卡显示净面积、总周长的 **P5 / P50 / P95** 区间及
+     **有效样本覆盖率（n/128）**；标定面板顶部汇总单应矩阵成功数、越界与退化数；
+   - **角点、误差半径或任一区域发生变化后，旧区间立即作废**并自动按新几何重算；
+   - 扰动角点**越出照片边界**、单应矩阵**退化不可逆**、或某区域在扰动后
+     **几何非法**（自交 / 孔洞越界 / 相切等）的样本都**计入失败比例，绝不静默丢弃**；
+   - 某区域**有效样本比例低于 80%** 时**不展示其区间**，卡片与顶部汇总明确提示
+     「请重新标定」（放大参照物、让角点远离照片边缘、更精确地点击四角）。
 
 ### 鼠标与快捷键
 
@@ -165,6 +182,40 @@ JSON 中可能没有 `holes` / `gross_area` 字段，加载时按无孔洞处理
 面积/周长单位为标定所填单位（其平方）。`all_measurements_valid=false` 表示
 标定或至少一个区域（外环或任一孔洞关系）无效，对应条目的 `errors` 给出原因。
 
+当本次会话设置过误差半径时，导出 JSON 还包含一个派生（导出时即时重算、不单独存盘）
+的 `sensitivity` 段；未设置或标定无效时该段为 `null` / `available:false`：
+
+```json
+"sensitivity": {
+  "radius_px": 2.0,
+  "samples": 128,
+  "seed": "8ce4f37d…",
+  "out_of_bounds_samples": 0,
+  "degenerate_samples": 0,
+  "homography_valid_samples": 128,
+  "min_coverage": 0.8,
+  "all_intervals_shown": true,
+  "available": true,
+  "regions": [
+    {
+      "id": "…",
+      "valid_samples": 128,
+      "total_samples": 128,
+      "coverage": 1.0,
+      "invalid_geometry_samples": 0,
+      "intervals_shown": true,
+      "area_p5": 351.2, "area_p50": 353.1, "area_p95": 355.0,
+      "perimeter_p5": 122.6, "perimeter_p50": 123.4, "perimeter_p95": 124.2,
+      "note": ""
+    }
+  ]
+}
+```
+
+`intervals_shown=false`（覆盖率 < 80%）时各百分位字段为 `null`，`note` 给出
+重新标定提示。会话 JSON 中只持久化用户选择的 `sensitivity_radius`；**128 组扰动
+是派生数据，加载会话 / 容器重启后用相同种子重算，结果一致**。
+
 ## 算法说明
 
 - 设图像点 `p=(u,v,1)`、实面坐标 `X=(x,y,1)`，映射 `X ∼ H p`。
@@ -181,6 +232,23 @@ JSON 中可能没有 `holes` / `gross_area` 字段，加载时按无孔洞处理
   再以射线法确认每个孔洞顶点严格位于外环内、且任意两洞互不包含。
   净面积 = 外环鞋带面积 − Σ 孔洞鞋带面积，总周长 = 外环周长 + Σ 孔洞周长。
 
+### 标定敏感性（128 组固定扰动）
+
+- 随机种子 = `SHA-256(JSON(四角坐标, 矩形宽高, 半径))`，与区域无关；扰动流用
+  纯 Python 的 splitmix64（前端只负责发起请求，不生成扰动，保证“后端可复现”）。
+- 每个角点从**半径 R 的均匀圆盘**内独立采样一个偏移 `(Δu, Δv)`
+  （`r = R·√ξ₁, θ = 2π·ξ₂`，避免边缘过采样），四角同时偏移后重解 DLT 单应。
+- 单个样本的失败分三类并全部计入分母：
+  1. **越界** `out_of_bounds_samples`：扰动后任一角点超出照片边界 `[0,W]×[0,H]`；
+  2. **退化** `degenerate_samples`：四点重合 / 共线 / 非凸、DLT 秩亏损、
+     行列式近零或角点落到无穷远线（复用 `solve_homography` 的同一套校验）；
+  3. **区域非法** `invalid_geometry_samples`：单应可解，但某区域变换后自交、
+     孔洞越界 / 相切 / 嵌套，或面积周长出现非有限值（复用 `measure_region`）。
+- 对**有效样本**的面积、周长分别取线性插值的 P5 / P50 / P95；覆盖率 =
+  有效样本 / 128。覆盖率 < 0.80 的区域不返回区间（百分位为 `null`）并附重新
+  标定提示。**任何失败样本都不会被静默丢弃**——三类计数之和恒为 128。
+- 半径为 0 时 128 组扰动恒等，区间退化为当前标称值，可用于自检。
+
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -190,7 +258,8 @@ JSON 中可能没有 `holes` / `gross_area` 字段，加载时按无孔洞处理
 | POST | `/api/sessions/{id}/image` | 上传/替换照片（multipart，清空旧几何） |
 | PUT | `/api/sessions/{id}/calibration` | 提交四角与实际宽高，返回 H 与全部区域复算结果 |
 | POST/PUT/DELETE | `/api/sessions/{id}/polygons[/{pid}]` | 新增 / 更新 / 删除区域（请求体可带 `holes`：`[{points:[…]}]`）；几何非法的新增/更新返回 **422** 且不覆盖服务端已存的最后有效结果；DELETE 集合路径清空 |
-| GET | `/api/sessions/{id}/export` | 下载测量 JSON（attachment） |
+| POST | `/api/sessions/{id}/sensitivity` | 标定敏感性评估：请求体 `{"radius_px": 2.0}`，返回固定 128 组可复现扰动下每个区域的面积/周长 P5/P50/P95、有效样本覆盖率与失败分类；半径持久化到会话 |
+| GET | `/api/sessions/{id}/export` | 下载测量 JSON（attachment，含派生的 `sensitivity` 段） |
 | GET | `/api/health` | 健康检查（容器 HEALTHCHECK） |
 
 ## 项目结构
@@ -202,16 +271,17 @@ JSON 中可能没有 `holes` / `gross_area` 字段，加载时按无孔洞处理
 ├── backend/
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py          # FastAPI：会话/上传/标定/多边形/导出
-│       └── geometry.py      # DLT 单应矩阵、可逆性检查、自交与环关系校验、含孔面积周长
+│       ├── main.py          # FastAPI：会话/上传/标定/多边形/敏感性/导出
+│       └── geometry.py      # DLT 单应矩阵、可逆性检查、自交与环关系校验、含孔面积周长、128 组标定敏感性扰动
 ├── frontend/
 │   ├── index.html
 │   ├── styles.css
-│   └── app.js               # 画布、视图变换、外环/孔洞交互、镜像几何算法
+│   └── app.js               # 画布、视图变换、外环/孔洞交互、镜像几何算法、敏感性结果卡
 ├── data/                    # 运行时生成：images/ 与 sessions/（挂载卷）
 └── tests/
     ├── test_geometry.py     # 合成透视相机数值校验（NumPy）
-    ├── test_api.py          # FastAPI 端到端：上传→标定→多边形→导出
+    ├── test_sensitivity.py  # 敏感性引擎：PRNG 确定性、种子、百分位、越界/退化/非法计数
+    ├── test_api.py          # FastAPI 端到端：上传→标定→多边形→敏感性→导出
     └── parity_geometry.mjs  # 前端 JS 几何与后端数值一致性（Node）
 ```
 
@@ -220,6 +290,7 @@ JSON 中可能没有 `holes` / `gross_area` 字段，加载时按无孔洞处理
 ```bash
 pip install -r backend/requirements.txt httpx
 python3 tests/test_geometry.py
+python3 tests/test_sensitivity.py
 python3 tests/test_api.py
 node tests/parity_geometry.mjs
 ```
