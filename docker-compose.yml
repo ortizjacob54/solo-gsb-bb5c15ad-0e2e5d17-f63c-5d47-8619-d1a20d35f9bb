@@ -1,0 +1,11 @@
+services:
+  photo-ruler:
+    build: .
+    image: photo-ruler:latest
+    container_name: photo-ruler
+    ports:
+      - "8000:8000"
+    volumes:
+      # Keep uploaded photos, sessions and exported measurements on the host.
+      - ./data:/app/data
+    restart: unless-stopped

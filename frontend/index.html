@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>平面照片标尺校准</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext y='20' font-size='20'%3E%F0%9F%93%8F%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">📐</span>
+      <div class="brand-text">
+        <h1>平面照片标尺校准</h1>
+        <span class="brand-sub">单应矩阵透视校正 · 含镂空孔洞的面积 / 周长</span>
+      </div>
+    </div>
+    <div class="top-actions">
+      <label class="btn btn-primary" id="uploadLabel" title="上传本地照片">
+        <input type="file" id="fileInput" accept="image/*" hidden />
+        <span>⬆ 上传照片</span>
+      </label>
+      <button class="btn" id="exportBtn" disabled title="导出本次测量为 JSON">⬇ 导出 JSON</button>
+    </div>
+  </header>
+
+  <div class="app">
+    <main class="stage" id="stage">
+      <canvas id="canvas"></canvas>
+
+      <div class="overlay" id="emptyOverlay">
+        <div class="dropzone" id="dropzone">
+          <div class="dropzone-icon">🖼️</div>
+          <h2>拖入照片或点击上方“上传照片”</h2>
+          <p>支持 JPG / PNG / WebP，照片中需包含一个<b>已知实际宽 × 高的矩形</b>（卡片、标尺框、打印矩形等）</p>
+          <p class="hint">所有计算在浏览器实时完成；图像仅保存在本服务端会话目录</p>
+        </div>
+      </div>
+
+      <div class="notice hidden" id="notice">
+        <span class="notice-icon">⚠</span>
+        <span id="noticeText"></span>
+        <button class="notice-close" id="noticeClose" title="关闭">✕</button>
+      </div>
+
+      <div class="zoombar">
+        <button id="zoomOut" title="缩小 (−)">−</button>
+        <span id="zoomLevel">—</span>
+        <button id="zoomIn" title="放大 (+)">+</button>
+        <button id="zoomFit" title="适合窗口 (F)">⊡</button>
+        <button id="zoomOne" title="100% (1)">1:1</button>
+      </div>
+
+      <div class="statusbar">
+        <span id="modeLabel">模式：—</span>
+        <span id="cursorLabel" class="dim">图像坐标 —</span>
+        <span class="dim" id="hintLabel"></span>
+      </div>
+    </main>
+
+    <aside class="sidebar">
+      <!-- Step 1 -->
+      <section class="panel" id="calibPanel">
+        <div class="panel-head">
+          <span class="step-badge">1</span>
+          <h2>透视标定</h2>
+        </div>
+        <div class="panel-body">
+          <div class="dim-inputs">
+            <label>矩形实际宽
+              <input type="number" id="rectW" min="0" step="any" placeholder="如 85.6" />
+            </label>
+            <label>矩形实际高
+              <input type="number" id="rectH" min="0" step="any" placeholder="如 53.98" />
+            </label>
+            <label>单位
+              <select id="rectUnit">
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="in">in</option>
+                <option value="px">px</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="mode-row">
+            <button class="btn btn-mode active" id="modeCalib">◎ 角点</button>
+            <button class="btn btn-mode" id="modePan" title="平移（按住空格也可临时平移）">✋ 平移</button>
+            <button class="btn btn-ghost danger" id="clearCorners" title="清除全部角点重新标记">重画角点</button>
+          </div>
+
+          <ol class="corner-list" id="cornerList"></ol>
+
+          <div class="calib-status" id="calibStatus">
+            <span class="dot dot-idle"></span><span>先上传照片，再依次点击矩形四角</span>
+          </div>
+          <p class="tip">按 <b>左上 → 右上 → 右下 → 左下</b> 顺序点击（与矩形朝向无关）。
+            四角可随时拖动微调，标定结果实时更新。</p>
+        </div>
+      </section>
+
+      <!-- Step 2 -->
+      <section class="panel" id="drawPanel">
+        <div class="panel-head">
+          <span class="step-badge">2</span>
+          <h2>绘制测量区域</h2>
+        </div>
+        <div class="panel-body">
+          <div class="mode-row">
+            <button class="btn btn-mode" id="modeDraw" disabled>✏ 绘制外环</button>
+            <button class="btn btn-mode" id="modeHole" disabled title="在已闭合的外环内绘制镂空孔洞">▰ 镂空孔洞</button>
+            <button class="btn btn-mode" id="modeEdit" disabled>↔ 编辑</button>
+            <button class="btn btn-ghost" id="modeDrawAnother" disabled title="保留已有区域并绘制下一个多边形">＋ 再画一个</button>
+            <button class="btn btn-ghost danger" id="clearPolys" disabled>清空区域</button>
+          </div>
+          <p class="tip">绘制模式下逐点单击，<b>双击 / Enter</b> 闭合；Esc 取消，Backspace 撤销顶点。
+            选中区域后点「镂空孔洞」（或按 <b>5</b>）在其外环内部绘制孔洞：孔洞必须完全位于外环内，
+            且孔洞与外环、孔洞之间<b>不得相交或相切</b>。编辑模式可拖动外环/孔洞顶点、整体拖动区域、右键删除顶点。</p>
+        </div>
+      </section>
+
+      <!-- Results -->
+      <section class="panel panel-grow">
+        <div class="panel-head">
+          <span class="step-badge">3</span>
+          <h2>测量结果</h2>
+          <select id="displayUnit" class="unit-select" title="结果显示单位"></select>
+        </div>
+        <div class="panel-body poly-list" id="polyList">
+          <p class="empty-text">完成标定并绘制闭合多边形后，这里实时显示校正后的面积与周长。</p>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
